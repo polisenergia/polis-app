@@ -1094,7 +1094,7 @@ elif scelta == "Preventivo di Connessione":
 
     if passaggio_mt:
         c_tec += COSTO_PASSAGGIO_MT
-    if escludi_gestione
+    if escludi_gestione:
         c_gest = 0.0
     else
         c_gest = round((c_tec + FISSO_BASE_CALCOLO) * 0.1, 2)
