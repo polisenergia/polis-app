@@ -981,6 +981,7 @@ elif scelta == "Preventivo di Connessione":
         key="prat"
     )
     tipo_ut = c4.radio("Utenza", ["Domestico", "Altri Usi"], horizontal=True, key="ut")
+   
 
     # Inizializzazione valori
     p_att, p_new, c_dist, delta, tar = 0.0, 0.0, 0.0, 0.0, 0.0
@@ -989,6 +990,7 @@ elif scelta == "Preventivo di Connessione":
     tipo_fornitura = "Permanente"
     no_lim_attuale   = False
     richiesta_no_lim = False
+    escludi_gestione = st.checkbox("Sconto 100% Gestione Polis", value=False)
 
     if "Potenza" in pratica or "Subentro" in pratica or "Attivazione" in pratica:
         col1, col2 = st.columns(2)
@@ -1092,15 +1094,17 @@ elif scelta == "Preventivo di Connessione":
 
     if passaggio_mt:
         c_tec += COSTO_PASSAGGIO_MT
-
-    c_gest = round((c_tec + FISSO_BASE_CALCOLO) * 0.1, 2)
-    imp    = round(c_tec + c_gest + ONERI_ISTRUTTORIA, 2)
-    iva_p  = 10 if "10" in regime else (22 if "22" in regime or "P.A." in regime else 0)
-    iva_e  = round(imp * (iva_p / 100), 2)
-    bollo  = 2.0 if (regime == "Esente" and imp > 77.47) else 0.0
-    totale = (round(imp + bollo, 2)
-              if "P.A." in regime
-              else round(imp + iva_e + bollo, 2))
+    if escludi_gestione
+        c_gest = 0.0
+    else
+        c_gest = round((c_tec + FISSO_BASE_CALCOLO) * 0.1, 2)
+        imp    = round(c_tec + c_gest + ONERI_ISTRUTTORIA, 2)
+        iva_p  = 10 if "10" in regime else (22 if "22" in regime or "P.A." in regime else 0)
+        iva_e  = round(imp * (iva_p / 100), 2)
+        bollo  = 2.0 if (regime == "Esente" and imp > 77.47) else 0.0
+        totale = (round(imp + bollo, 2)
+                  if "P.A." in regime
+                  else round(imp + iva_e + bollo, 2))
 
     # --- Anteprima calcolo ---
     st.subheader("📊 Anteprima Calcolo")
