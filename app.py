@@ -1098,13 +1098,13 @@ elif scelta == "Preventivo di Connessione":
         c_gest = 0.0
     else:
         c_gest = round((c_tec + FISSO_BASE_CALCOLO) * 0.1, 2)
-        imp    = round(c_tec + c_gest + ONERI_ISTRUTTORIA, 2)
-        iva_p  = 10 if "10" in regime else (22 if "22" in regime or "P.A." in regime else 0)
-        iva_e  = round(imp * (iva_p / 100), 2)
-        bollo  = 2.0 if (regime == "Esente" and imp > 77.47) else 0.0
-        totale = (round(imp + bollo, 2)
-                  if "P.A." in regime
-                  else round(imp + iva_e + bollo, 2))
+    imp    = round(c_tec + c_gest + ONERI_ISTRUTTORIA, 2)
+    iva_p  = 10 if "10" in regime else (22 if "22" in regime or "P.A." in regime else 0)
+    iva_e  = round(imp * (iva_p / 100), 2)
+    bollo  = 2.0 if (regime == "Esente" and imp > 77.47) else 0.0
+    totale = (round(imp + bollo, 2)
+                if "P.A." in regime
+                else round(imp + iva_e + bollo, 2))
 
     # --- Anteprima calcolo ---
     st.subheader("📊 Anteprima Calcolo")
