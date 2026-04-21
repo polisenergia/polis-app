@@ -1096,7 +1096,7 @@ elif scelta == "Preventivo di Connessione":
         c_tec += COSTO_PASSAGGIO_MT
     if escludi_gestione:
         c_gest = 0.0
-    else
+    else:
         c_gest = round((c_tec + FISSO_BASE_CALCOLO) * 0.1, 2)
         imp    = round(c_tec + c_gest + ONERI_ISTRUTTORIA, 2)
         iva_p  = 10 if "10" in regime else (22 if "22" in regime or "P.A." in regime else 0)
