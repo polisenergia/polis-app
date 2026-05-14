@@ -1,3 +1,20 @@
+"""
+PolisEnergia — Operation Suite
+==============================
+App Streamlit per gestione autoletture, preventivi di connessione e archivio.
+
+Versione: 2.0 (refactored)
+Modifiche principali rispetto alla 1.4:
+  - OTP salvato nel Google Sheet (i vecchi link vengono invalidati al reinvio)
+  - Funzione `calcola_stato_reale` deduplicata e globale
+  - Cache GSheets con TTL configurabile (perf)
+  - Cache ARERA in memoria
+  - Magic numbers spostati nelle costanti
+  - Fix crash su data malformata in pagina firma
+  - Import puliti, codice morto rimosso
+  - Errori tecnici nascosti in produzione (mostrati solo in modalità debug)
+"""
+
 import streamlit as st
 import math
 import pandas as pd
@@ -9,10 +26,14 @@ import os
 import smtplib
 import ssl
 import zipfile
+import zlib
+import json
+import base64 as _b64
+import numpy as np
+import streamlit.components.v1 as components
+
 from collections import defaultdict
 from datetime import datetime, timedelta
-
-from sqlalchemy import text
 from streamlit_gsheets import GSheetsConnection
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
@@ -21,7 +42,7 @@ from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 
 # ==============================================================================
-# 1. CONFIGURAZIONE PAGINA (una sola chiamata, sempre la prima)
+# 1. CONFIGURAZIONE PAGINA
 # ==============================================================================
 st.set_page_config(
     page_title="PolisEnergia - Operation Suite",
@@ -33,15 +54,22 @@ st.set_page_config(
 # ==============================================================================
 # 2. COSTANTI GLOBALI
 # ==============================================================================
+
+# --- Dati aziendali ---
 IBAN_POLIS          = "IT80P0103015200000007044056"
 NOME_BANCA          = "Monte dei Paschi di Siena"
 INTESTATARIO        = "POLISENERGIA SRL"
 IBAN_LABEL          = f"{IBAN_POLIS} - {NOME_BANCA}"
 MAIL_CC             = "assistenza@polisenergia.it"
 APP_URL             = "https://operation-polisenergia.streamlit.app"
-OTP_SCADENZA_GIORNI = 30   # giorni di validità del link di firma
 
-# Tariffe preventivo
+# --- Configurazione operativa ---
+OTP_SCADENZA_GIORNI = 30        # validità link di firma
+GSHEETS_CACHE_TTL   = 60        # secondi di cache lettura archivio
+GSHEETS_MAX_CHARS   = 49000     # limite per HTML compresso nella cella
+DEBUG_MODE          = False     # True per mostrare dettagli errori
+
+# --- Tariffe preventivo ---
 TIC_DOMESTICO_LE6   = 62.30
 TIC_ALTRI_USI_BT    = 78.81
 TIC_MT              = 62.74
@@ -50,8 +78,19 @@ SPOSTAMENTO_10MT    = 226.36
 FISSO_BASE_CALCOLO  = 25.88
 COSTO_PASSAGGIO_MT  = 494.83
 
+# --- Soglie e tariffe fornitura temporanea ---
+TEMP_LE40_NO_ATTR   = 168.01    # ≤40 kW senza attraversamento stradale
+TEMP_LE40_ATTR      = 280.01    # ≤40 kW con attraversamento stradale
+SOGLIA_TEMP_KW      = 40        # potenza che separa tariffa fissa da quota distributore
+SOGLIA_LIMITATORE   = 30        # potenza max per gestione franchigia 10%
+SOGLIA_AGEVOL_DOM   = 6         # kW max per tariffa agevolata domestico
+
+# --- Bollo ---
+BOLLO_ESENTE        = 2.0
+SOGLIA_BOLLO        = 77.47
+
 # ==============================================================================
-# 3. CSS (una sola volta)
+# 3. CSS
 # ==============================================================================
 st.markdown("""
     <style>
@@ -81,22 +120,33 @@ st.markdown("""
 # 4. FUNZIONI DI UTILITÀ
 # ==============================================================================
 
-def formatta_data_italiana(data_raw: str) -> str:
-    """Converte qualsiasi formato data in GG/MM/AAAA."""
-    d = str(data_raw).strip().split(' ')[0]
+def mostra_errore(msg_utente: str, dettaglio: Exception | str = ""):
+    """Mostra errore generico all'utente; il dettaglio tecnico solo in DEBUG_MODE."""
+    st.error(msg_utente)
+    if DEBUG_MODE and dettaglio:
+        st.caption(f"Dettaglio tecnico: {dettaglio}")
+
+
+def formatta_data_italiana(data_raw) -> str:
+    """Converte qualsiasi formato data in GG/MM/AAAA usando pandas (robusto)."""
     try:
-        parti = re.split(r'[/.\-]', d)
-        if len(parti) == 3:
-            if len(parti[0]) == 4:          # formato ISO: AAAA-MM-GG
-                anno, mese, giorno = parti[0], parti[1].zfill(2), parti[2].zfill(2)
-            else:                            # formato italiano: GG/MM/AAAA
-                giorno, mese, anno = parti[0].zfill(2), parti[1].zfill(2), parti[2]
-            if len(anno) == 2:
-                anno = "20" + anno
-            return f"{giorno}/{mese}/{anno}"
+        return pd.to_datetime(str(data_raw), dayfirst=True, errors="raise").strftime("%d/%m/%Y")
     except Exception:
-        pass
-    return d
+        # Fallback con regex per casi edge che pandas rifiuta
+        d = str(data_raw).strip().split(' ')[0]
+        try:
+            parti = re.split(r'[/.\-]', d)
+            if len(parti) == 3:
+                if len(parti[0]) == 4:
+                    anno, mese, giorno = parti[0], parti[1].zfill(2), parti[2].zfill(2)
+                else:
+                    giorno, mese, anno = parti[0].zfill(2), parti[1].zfill(2), parti[2]
+                if len(anno) == 2:
+                    anno = "20" + anno
+                return f"{giorno}/{mese}/{anno}"
+        except Exception:
+            pass
+        return d
 
 
 def pulisci_valore(valore) -> str | None:
@@ -134,16 +184,23 @@ def genera_otp() -> str:
     return str(secrets.randbelow(900000) + 100000)
 
 
-def otp_scaduto(data_creazione_str: str) -> bool:
+def calcola_stato_reale(row, giorni_validita: int = OTP_SCADENZA_GIORNI) -> str:
     """
-    Restituisce True se l'OTP è scaduto (oltre OTP_SCADENZA_GIORNI giorni).
-    data_creazione_str deve essere nel formato '%d/%m/%Y %H:%M'.
+    Calcola lo stato effettivo di un preventivo considerando la scadenza.
+    Restituisce uno tra: PAGATO, ACCETTATO, SCADUTO, INVIATO.
     """
+    s = str(row.get("Stato", "")).strip().upper()
+    if s == "PAGATO":
+        return "PAGATO"
+    if s == "ACCETTATO":
+        return "ACCETTATO"
     try:
-        data_creazione = datetime.strptime(data_creazione_str, "%d/%m/%Y %H:%M")
-        return datetime.now() > data_creazione + timedelta(days=OTP_SCADENZA_GIORNI)
+        data_c = datetime.strptime(str(row["Data"]).strip(), "%d/%m/%Y")
+        if datetime.now() > data_c + timedelta(days=giorni_validita):
+            return "SCADUTO"
     except Exception:
-        return True  # Se non riusciamo a leggere la data, consideriamo scaduto
+        pass
+    return "INVIATO"
 
 
 def invia_email(smtp: dict, to: str, subject: str, body: str,
@@ -164,147 +221,38 @@ def invia_email(smtp: dict, to: str, subject: str, body: str,
         server.login(smtp["sender"], smtp["password"])
         server.send_message(msg)
 
-        
-# ==============================================================================
-# 6. PAGINA CLIENTE: ACCETTAZIONE ONLINE (intercettazione via query params)
-# ==============================================================================
 
-codice_param = st.query_params.get("codice", "")
-otp_param    = st.query_params.get("otp", "")
+@st.cache_data(show_spinner=False)
+def carica_arera(percorso: str = "arera.csv") -> dict:
+    """Legge il file ARERA una sola volta e lo cacha in memoria."""
+    df = pd.read_csv(percorso, encoding='latin-1', sep=';',
+                     on_bad_lines='skip', dtype=str)
+    df.columns = [c.strip().upper() for c in df.columns]
+    return {
+        "".join(filter(str.isdigit, str(r['PARTITA IVA']))).zfill(11):
+        {'nome': str(r['RAGIONE SOCIALE']).strip().upper()}
+        for _, r in df.iterrows()
+    }
 
-if codice_param:
-    st.title("🖋️ Visualizzazione Preventivo")
-    cod_u = str(codice_param).strip().replace('.0', '')
-    otp_u = str(otp_param).strip()
 
+def comprimi_html(html: str) -> str:
+    """Comprime con zlib e codifica Base64; restituisce '' se troppo grande."""
+    b64 = _b64.b64encode(zlib.compress(html.encode("utf-8"), level=9)).decode("utf-8")
+    return b64 if len(b64) <= GSHEETS_MAX_CHARS else ""
+
+
+def decomprimi_html(b64_value: str) -> str:
+    """Decomprime HTML compresso. Fallback su Base64 semplice per retrocompatibilità."""
+    if not b64_value or b64_value in {"", "nan", "None"}:
+        return ""
     try:
-        conn   = st.connection("gsheets", type=GSheetsConnection)
-        df     = conn.read(ttl=0)
-        df['Codice_Clean'] = df['Codice'].astype(str).str.strip().str.replace('.0', '', regex=False)
-
-        if cod_u not in df['Codice_Clean'].values:
-            st.error("⚠️ Link non valido o preventivo non trovato. Contatta PolisEnergia.")
-            st.stop()
-
-        idx            = df[df['Codice_Clean'] == cod_u].index[0]
-        nome_cliente   = df.at[idx, "Cliente"]
-        stato_attuale  = str(df.at[idx, "Stato"]).strip()
-
-        if not otp_u:
-            st.info(f"🔍 Modalità Anteprima Operatore - Cliente: **{nome_cliente}**")
-            dati_per_html = df.iloc[idx].to_dict()
-            try:
-                codice_html = genera_html_polis(dati_per_html)
-                st.components.v1.html(codice_html, height=900, scrolling=True)
-                st.download_button(
-                    label="📥 Scarica file HTML",
-                    data=codice_html,
-                    file_name=f"Preventivo_{cod_u}.html",
-                    mime="text/html"
-                )
-            except Exception as e:
-                st.error(f"Errore nella generazione grafica: {e}")
-                st.write("Dati grezzi preventivo:", dati_per_html)
-            
-            st.stop()
-            
-        # Già firmato
-        if stato_attuale == "ACCETTATO":
-            st.success("✅ Questo preventivo è già stato firmato. Grazie!")
-            st.stop()
-
-        # Verifica scadenza OTP (usa la colonna "Data" di creazione preventivo)
-        data_creazione = str(df.at[idx, "Data"]).strip()
-        # La colonna Data contiene solo GG/MM/AAAA — aggiungiamo orario fittizio 00:00
-        # Se esiste una colonna Data_OTP più precisa, usare quella
+        return zlib.decompress(_b64.b64decode(b64_value)).decode("utf-8")
+    except Exception:
         try:
-            data_per_scadenza = datetime.strptime(data_creazione, "%d/%m/%Y")
-            scaduto = datetime.now() > data_per_scadenza + timedelta(days=OTP_SCADENZA_GIORNI)
+            return _b64.b64decode(b64_value).decode("utf-8")
         except Exception:
-            scaduto = True
+            return ""
 
-        if scaduto:
-            st.error(
-                f"⏰ Il link di firma è scaduto (validità {OTP_SCADENZA_GIORNI} giorni). "
-                f"Contatta PolisEnergia per ricevere un nuovo preventivo."
-            )
-            st.stop()
-
-        try:
-            importo_totale = float(df.at[idx, "Totale"])
-        except Exception:
-            importo_totale = 0.0
-
-        # Calcolo giorni rimanenti
-        data_scadenza   = data_per_scadenza + timedelta(days=OTP_SCADENZA_GIORNI)
-        giorni_rimanenti = (data_scadenza - datetime.now()).days
-
-        # Box istruzioni pagamento
-        st.markdown(f"""
-            <div style="background:rgba(255,255,255,0.1);padding:20px;border-radius:10px;
-                        border:1px solid white;margin-bottom:25px;">
-                <h3 style="color:white;margin-top:0;">💳 Istruzioni per il pagamento</h3>
-                <p style="color:white;font-size:1.1em;"><strong>Cliente:</strong> {nome_cliente}</p>
-                <p style="color:white;font-size:1.1em;">
-                    <strong>Importo:</strong> {importo_totale:.2f} EUR
-                </p>
-                <p style="color:#ffe08a;font-size:0.9em;">
-                    ⏳ Link valido ancora per <strong>{giorni_rimanenti} giorni</strong>
-                    (scade il {data_scadenza.strftime('%d/%m/%Y')})
-                </p>
-                <hr style="border-color:rgba(255,255,255,0.3);">
-                <p style="color:white;font-weight:bold;margin-bottom:5px;">COORDINATE BANCARIE:</p>
-                <ul style="color:white;list-style-type:none;padding-left:0;">
-                    <li><strong>Intestatario:</strong> {INTESTATARIO}</li>
-                    <li><strong>Banca:</strong> {NOME_BANCA}</li>
-                    <li><strong>IBAN:</strong>
-                        <span style="font-family:monospace;background:rgba(0,0,0,0.2);
-                                     padding:2px 5px;">{IBAN_POLIS}</span>
-                    </li>
-                    <li><strong>Causale:</strong> Accettazione Preventivo {cod_u} - {nome_cliente}</li>
-                </ul>
-            </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("<p style='color:white;font-weight:bold;'>Inserisci l'OTP ricevuto via mail:</p>",
-                    unsafe_allow_html=True)
-        otp_in = st.text_input("OTP:", max_chars=6, label_visibility="collapsed")
-
-        if st.button("✅ FIRMA E ACCETTA ORA"):
-            if not otp_in.strip():
-                st.warning("Inserisci il codice OTP prima di procedere.")
-            elif otp_in.strip() == otp_u:
-                df.at[idx, "Stato"]      = "ACCETTATO"
-                df.at[idx, "Data Firma"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-                conn.update(data=df.drop(columns=['Codice_Clean']))
-
-                # Notifica interna (silenziosa in caso di errore)
-                try:
-                    smtp = get_smtp_config()
-                    invia_email(
-                        smtp=smtp,
-                        to=smtp["sender"],
-                        subject=f"✅ PREVENTIVO FIRMATO: {nome_cliente}",
-                        body=(
-                            f"Il cliente {nome_cliente} ha accettato il preventivo {cod_u}.\n"
-                            f"Data firma: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
-                            f"Controlla il database."
-                        )
-                    )
-                except Exception:
-                    pass
-
-                st.success("✅ Documento firmato con successo!")
-                st.balloons()
-            else:
-                st.error("❌ OTP non corretto. Riprova o contatta PolisEnergia.")
-
-    except Exception as e:
-        st.error("Si è verificato un errore tecnico. Contatta PolisEnergia.")
-        # Log tecnico solo in sviluppo — rimuovere in produzione:
-        st.caption(f"Dettaglio tecnico: {e}")
-
-    st.stop()   # Il cliente non vede mai l'area operativa
 # ==============================================================================
 # 5. GENERAZIONE PDF PREVENTIVO
 # ==============================================================================
@@ -312,13 +260,13 @@ if codice_param:
 def genera_pdf_polis(d: dict) -> bytes:
     """Genera il PDF del preventivo con font Lato e logo aziendale."""
 
-    # --- PALETTE ---
-    BLUE_DARK  = (0,   51, 102)   # header, intestazioni tabella, totale
-    BLUE_LIGHT = (230, 240, 250)  # sfondo riga totale
-    BLUE_MID   = (0,   90, 170)   # accento linea decorativa e bordo sinistro box
-    GRAY_BG    = (247, 248, 250)  # sfondo box cliente e righe alternate
-    GRAY_TEXT  = (60,  60,  60)   # testo corpo
-    GRAY_MUTED = (140, 140, 140)  # note, label secondari
+    # --- Palette ---
+    BLUE_DARK  = (0,   51, 102)
+    BLUE_LIGHT = (230, 240, 250)
+    BLUE_MID   = (0,   90, 170)
+    GRAY_BG    = (247, 248, 250)
+    GRAY_TEXT  = (60,  60,  60)
+    GRAY_MUTED = (140, 140, 140)
     WHITE      = (255, 255, 255)
     BLACK      = (20,  20,  20)
 
@@ -326,7 +274,6 @@ def genera_pdf_polis(d: dict) -> bytes:
     pdf.set_margins(14, 14, 14)
     pdf.add_page()
 
-    # --- FONT LATO (con fallback su Helvetica se i file non esistono) ---
     try:
         pdf.add_font("Lato", "",  "Lato-Regular.ttf", uni=True)
         pdf.add_font("Lato", "B", "Lato-Bold.ttf",    uni=True)
@@ -334,27 +281,20 @@ def genera_pdf_polis(d: dict) -> bytes:
     except Exception:
         FONT = "helvetica"
 
-    # ── HEADER ────────────────────────────────────────────────────────────────
-    # Banda blu piena
+    # ── HEADER ──
     pdf.set_fill_color(*BLUE_DARK)
     pdf.rect(0, 0, 210, 48, 'F')
-
-    # Linea decorativa sottile azzurra sotto l'header
     pdf.set_fill_color(*BLUE_MID)
     pdf.rect(0, 48, 210, 1.5, 'F')
 
-    # Logo (larghezza 38 mm, verticalmente centrato nella banda)
-    LOGO_W = 38
     try:
-        pdf.image("logo_polis.png", x=14, y=7, w=LOGO_W)
+        pdf.image("logo_polis.png", x=14, y=7, w=38)
     except Exception:
-        # Fallback testuale se il logo non è disponibile
         pdf.set_xy(14, 14)
         pdf.set_text_color(*WHITE)
         pdf.set_font(FONT, "B", 18)
         pdf.cell(60, 10, "PolisEnergia")
 
-    # Dati aziendali — allineati a destra
     pdf.set_xy(110, 10)
     pdf.set_text_color(*WHITE)
     pdf.set_font(FONT, "B", 8.5)
@@ -367,10 +307,10 @@ def genera_pdf_polis(d: dict) -> bytes:
         "assistenza@polisenergia.it  |  www.polisenergia.it",
     ]:
         pdf.set_x(110)
-        pdf.set_text_color(200, 220, 245)   # bianco leggermente smorzato
+        pdf.set_text_color(200, 220, 245)
         pdf.cell(86, 4.5, riga, align='R', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # ── TITOLO DOCUMENTO ──────────────────────────────────────────────────────
+    # ── TITOLO ──
     pdf.set_xy(14, 57)
     pdf.set_text_color(*BLACK)
     pdf.set_font(FONT, "B", 17)
@@ -379,20 +319,18 @@ def genera_pdf_polis(d: dict) -> bytes:
     pdf.set_x(14)
     pdf.set_font(FONT, "", 9)
     pdf.set_text_color(*GRAY_MUTED)
-    data_str  = datetime.now().strftime("%d/%m/%Y")
-    scad_str  = (datetime.now() + timedelta(days=OTP_SCADENZA_GIORNI)).strftime("%d/%m/%Y")
+    data_str = datetime.now().strftime("%d/%m/%Y")
+    scad_str = (datetime.now() + timedelta(days=OTP_SCADENZA_GIORNI)).strftime("%d/%m/%Y")
     pratica_label = d.get("Pratica", "")
     pdf.cell(0, 5.5,
              f"Emesso il {data_str}  —  Valido fino al {scad_str}"
              + (f"  —  {pratica_label}" if pratica_label else ""),
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # ── BOX DATI CLIENTE ──────────────────────────────────────────────────────
+    # ── BOX CLIENTE ──
     pdf.ln(6)
     box_y = pdf.get_y()
     box_h = 20
-
-    # Sfondo grigio + bordo sinistro colorato (effetto accent)
     pdf.set_fill_color(*GRAY_BG)
     pdf.rect(14, box_y, 182, box_h, 'F')
     pdf.set_fill_color(*BLUE_MID)
@@ -402,13 +340,11 @@ def genera_pdf_polis(d: dict) -> bytes:
     pdf.set_text_color(*GRAY_MUTED)
     pdf.set_font(FONT, "", 7.5)
     pdf.cell(0, 4, "SPETT.LE", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
     pdf.set_x(20)
     pdf.set_text_color(*BLACK)
     pdf.set_font(FONT, "B", 10.5)
     pdf.cell(100, 5, d['Cliente'], new_x=XPos.RIGHT, new_y=YPos.TOP)
 
-    # POD e indirizzo — colonna destra del box
     pdf.set_xy(122, box_y + 3.5)
     pdf.set_text_color(*GRAY_MUTED)
     pdf.set_font(FONT, "", 7.5)
@@ -422,54 +358,17 @@ def genera_pdf_polis(d: dict) -> bytes:
     pdf.set_text_color(*GRAY_MUTED)
     pdf.cell(74, 4, d['Indirizzo'], new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # ── Costruzione voci in base al tipo pratica ──────────────────────────────
-    pratica  = d.get("Pratica", "")
-    delta    = d.get("Delta",   0.0)
-    tar            = d.get("Tariffa", 0.0)
-    c_dist         = d.get("C_Dist",  0.0)
-    pass_mt        = d.get("Passaggio_MT", False)
-    tipo_fornitura = d.get("Tipo_Fornitura", "Permanente")
-    p_new_d        = d.get("P_New", 0.0)
-
-    if "Spostamento" in pratica:
-        entro = c_dist == SPOSTAMENTO_10MT
-        desc_tec = f"Quota Spostamento {'entro' if entro else 'oltre'} 10 mt"
-        voci_tec = [(desc_tec, d['C_Tec'])]
-    elif "Nuova" in pratica:
-        voci_tec = []
-        if tipo_fornitura == "Temporanea":
-            if p_new_d <= 40:
-                attr = "con attraversamento stradale" if c_dist == 280.01 else "senza attraversamento stradale"
-                voci_tec = [(f"Fornitura Temporanea ({attr})", d['C_Tec'])]
-            else:
-                voci_tec = [(f"Fornitura Temporanea >40 kW (quota distributore)", d['C_Tec'])]
-        else:
-            quota_pot = delta * tar
-            if quota_pot:
-                voci_tec.append((f"Quota Potenza  ({tar:.2f} €/kW × {delta:.1f} kW)", quota_pot))
-            if c_dist:
-                voci_tec.append(("Quota Distanza", c_dist))
-            if pass_mt:
-                voci_tec.append(("Passaggio a MT", COSTO_PASSAGGIO_MT))
-            if not voci_tec:
-                voci_tec = [("Quota Tecnica", d['C_Tec'])]
-    else:
-        # Aumento Potenza / Subentro / Attivazione
-        voci_tec = [(f"Quota Potenza  ({tar:.2f} €/kW × {delta:.1f} kW)", d['C_Tec'] - (COSTO_PASSAGGIO_MT if pass_mt else 0))]
-        if pass_mt:
-            voci_tec.append(("Passaggio a MT", COSTO_PASSAGGIO_MT))
-
+    # ── COSTRUZIONE VOCI ──
+    voci_tec = _costruisci_voci_tecniche(d)
     voci = voci_tec + [
         ("Oneri Amministrativi",   d['Oneri']),
         ("Oneri Gestione Pratica", d['Gestione']),
     ]
 
-    # ── TABELLA VOCI ──────────────────────────────────────────────────────────
+    # ── TABELLA ──
     pdf.ln(9)
     pdf.set_draw_color(220, 225, 232)
     pdf.set_line_width(0.2)
-
-    # Intestazione tabella
     pdf.set_fill_color(*BLUE_DARK)
     pdf.set_text_color(*WHITE)
     pdf.set_font(FONT, "B", 9)
@@ -486,18 +385,17 @@ def genera_pdf_polis(d: dict) -> bytes:
         pdf.cell(48,  9, f"{importo:.2f} EUR", border='B', fill=True, align='R',
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # ── SUBTOTALI ─────────────────────────────────────────────────────────────
+    # ── SUBTOTALI ──
     pdf.ln(2)
     pdf.set_font(FONT, "", 9)
     pdf.set_text_color(*GRAY_MUTED)
     for label, valore in [
         ("Totale imponibile", f"{d['Imponibile']:.2f} EUR"),
-        (f"IVA ({d['IVA_Perc']}%)",    f"{d['IVA_Euro']:.2f} EUR"),
+        (f"IVA ({d['IVA_Perc']}%)", f"{d['IVA_Euro']:.2f} EUR"),
     ]:
         pdf.cell(134, 7, label, align='R')
         pdf.cell(48,  7, valore, align='R', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # Riga totale finale — evidenziata
     pdf.ln(1)
     pdf.set_fill_color(*BLUE_LIGHT)
     pdf.set_text_color(*BLUE_DARK)
@@ -506,13 +404,11 @@ def genera_pdf_polis(d: dict) -> bytes:
     pdf.cell(48,  12, f"{d['Totale']:.2f} EUR", fill=True, align='R',
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # ── SEZIONE PAGAMENTO ─────────────────────────────────────────────────────
+    # ── PAGAMENTO ──
     pdf.ln(10)
-    # Piccola label categoria
     pdf.set_font(FONT, "B", 8)
     pdf.set_text_color(*BLUE_MID)
     pdf.cell(0, 5, "MODALITA' DI PAGAMENTO", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    # Linea sottile separatrice
     pdf.set_draw_color(*BLUE_MID)
     pdf.set_line_width(0.4)
     pdf.line(14, pdf.get_y(), 196, pdf.get_y())
@@ -531,7 +427,7 @@ def genera_pdf_polis(d: dict) -> bytes:
     pdf.cell(0, 5, f"Accettazione Preventivo {d['Codice']} — {d.get('Cliente', '')}",
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # ── FIRMA ─────────────────────────────────────────────────────────────────
+    # ── FIRMA ──
     pdf.ln(8)
     pdf.set_font(FONT, "", 8.5)
     pdf.set_text_color(*GRAY_MUTED)
@@ -540,12 +436,11 @@ def genera_pdf_polis(d: dict) -> bytes:
     pdf.ln(10)
     pdf.set_draw_color(*GRAY_MUTED)
     pdf.set_line_width(0.3)
-    pdf.line(14,  pdf.get_y(), 106, pdf.get_y())   # linea firma
-    pdf.line(112, pdf.get_y(), 160, pdf.get_y())   # linea data
+    pdf.line(14,  pdf.get_y(), 106, pdf.get_y())
+    pdf.line(112, pdf.get_y(), 160, pdf.get_y())
 
-    # ── FOOTER ────────────────────────────────────────────────────────────────
+    # ── FOOTER ──
     pdf.set_y(-28)
-    # Banda blu piena
     pdf.set_fill_color(*BLUE_DARK)
     pdf.rect(0, pdf.get_y(), 210, 28, 'F')
     pdf.set_x(14)
@@ -561,58 +456,61 @@ def genera_pdf_polis(d: dict) -> bytes:
 
     return bytes(pdf.output())
 
-# ==============================================================================
-# 5b. GENERAZIONE HTML PREVENTIVO + UPLOAD GOOGLE DRIVE
-# ==============================================================================
-import base64 as _b64
 
-DRIVE_FOLDER_ID = ""  # non utilizzato — archiviazione tramite Base64 nel Sheet
-
-
-def genera_html_polis(d: dict) -> str:
-    """Genera il preventivo come HTML standalone con logo Base64 incorporato."""
-    data_str = datetime.now().strftime("%d/%m/%Y")
-    scad_str = (datetime.now() + timedelta(days=OTP_SCADENZA_GIORNI)).strftime("%d/%m/%Y")
-
-    # Header: testo invece del logo PNG
-    logo_tag = '<div style="color:#fff;font-size:18px;font-weight:700;letter-spacing:.5px;">PolisEnergia srl</div>'
-
-    # ── Voci in base al tipo pratica ──────────────────────────────────────────
+def _costruisci_voci_tecniche(d: dict) -> list[tuple[str, float]]:
+    """
+    Costruisce la lista di voci tecniche (descrizione, importo) in base al tipo pratica.
+    Estratta per essere riusata sia da PDF che HTML.
+    """
     pratica        = d.get("Pratica", "")
-    delta          = d.get("Delta",   0.0)
+    delta          = d.get("Delta", 0.0)
     tar            = d.get("Tariffa", 0.0)
-    c_dist         = d.get("C_Dist",  0.0)
+    c_dist         = d.get("C_Dist", 0.0)
     pass_mt        = d.get("Passaggio_MT", False)
     tipo_fornitura = d.get("Tipo_Fornitura", "Permanente")
     p_new_d        = d.get("P_New", 0.0)
+    c_tec          = d.get("C_Tec", 0.0)
 
     if "Spostamento" in pratica:
         entro = c_dist == SPOSTAMENTO_10MT
-        voci_tec = [(f"Quota Spostamento {'entro' if entro else 'oltre'} 10 mt", d['C_Tec'])]
-    elif "Nuova" in pratica:
-        voci_tec = []
-        if tipo_fornitura == "Temporanea":
-            if p_new_d <= 40:
-                attr = "con attraversamento stradale" if c_dist == 280.01 else "senza attraversamento stradale"
-                voci_tec = [(f"Fornitura Temporanea ({attr})", d['C_Tec'])]
-            else:
-                voci_tec = [(f"Fornitura Temporanea >40 kW (quota distributore)", d['C_Tec'])]
-        else:
-            quota_pot = delta * tar
-            if quota_pot:
-                voci_tec.append((f"Quota Potenza ({tar:.2f} €/kW × {delta:.1f} kW)", quota_pot))
-            if c_dist:
-                voci_tec.append(("Quota Distanza", c_dist))
-            if pass_mt:
-                voci_tec.append(("Passaggio a MT", COSTO_PASSAGGIO_MT))
-            if not voci_tec:
-                voci_tec = [("Quota Tecnica", d['C_Tec'])]
-    else:
-        quota_pot = d['C_Tec'] - (COSTO_PASSAGGIO_MT if pass_mt else 0)
-        voci_tec = [(f"Quota Potenza ({tar:.2f} €/kW × {delta:.1f} kW)", quota_pot)]
-        if pass_mt:
-            voci_tec.append(("Passaggio a MT", COSTO_PASSAGGIO_MT))
+        return [(f"Quota Spostamento {'entro' if entro else 'oltre'} 10 mt", c_tec)]
 
+    if "Nuova" in pratica:
+        if tipo_fornitura == "Temporanea":
+            if p_new_d <= SOGLIA_TEMP_KW:
+                attr = "con attraversamento stradale" if c_dist == TEMP_LE40_ATTR else "senza attraversamento stradale"
+                return [(f"Fornitura Temporanea ({attr})", c_tec)]
+            return [("Fornitura Temporanea >40 kW (quota distributore)", c_tec)]
+
+        voci = []
+        quota_pot = delta * tar
+        if quota_pot:
+            voci.append((f"Quota Potenza  ({tar:.2f} €/kW × {delta:.1f} kW)", quota_pot))
+        if c_dist:
+            voci.append(("Quota Distanza", c_dist))
+        if pass_mt:
+            voci.append(("Passaggio a MT", COSTO_PASSAGGIO_MT))
+        return voci or [("Quota Tecnica", c_tec)]
+
+    # Aumento Potenza / Subentro / Attivazione
+    quota_pot = c_tec - (COSTO_PASSAGGIO_MT if pass_mt else 0)
+    voci = [(f"Quota Potenza  ({tar:.2f} €/kW × {delta:.1f} kW)", quota_pot)]
+    if pass_mt:
+        voci.append(("Passaggio a MT", COSTO_PASSAGGIO_MT))
+    return voci
+
+# ==============================================================================
+# 5b. GENERAZIONE HTML PREVENTIVO
+# ==============================================================================
+
+def genera_html_polis(d: dict) -> str:
+    """Genera il preventivo come HTML standalone."""
+    data_str = datetime.now().strftime("%d/%m/%Y")
+    scad_str = (datetime.now() + timedelta(days=OTP_SCADENZA_GIORNI)).strftime("%d/%m/%Y")
+
+    logo_tag = '<div style="color:#fff;font-size:18px;font-weight:700;letter-spacing:.5px;">PolisEnergia srl</div>'
+
+    voci_tec = _costruisci_voci_tecniche(d)
     voci = voci_tec + [
         ("Oneri Amministrativi",   d['Oneri']),
         ("Oneri Gestione Pratica", d['Gestione']),
@@ -628,6 +526,7 @@ def genera_html_polis(d: dict) -> str:
             f'{importo:.2f} EUR</td></tr>'
         )
 
+    pratica = d.get("Pratica", "")
     subtitle_extra = f" &nbsp;—&nbsp; {pratica}" if pratica else ""
 
     return f"""<!DOCTYPE html>
@@ -745,6 +644,161 @@ def genera_html_polis(d: dict) -> str:
 </div></body></html>"""
 
 # ==============================================================================
+# 6. PAGINA CLIENTE: ACCETTAZIONE ONLINE
+# ==============================================================================
+
+codice_param = st.query_params.get("codice", "")
+otp_param    = st.query_params.get("otp", "")
+
+if codice_param:
+    st.title("🖋️ Visualizzazione Preventivo")
+    cod_u = str(codice_param).strip().replace('.0', '')
+    otp_u = str(otp_param).strip()
+
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        df   = conn.read(ttl=0)
+        df['Codice_Clean'] = df['Codice'].astype(str).str.strip().str.replace('.0', '', regex=False)
+
+        if cod_u not in df['Codice_Clean'].values:
+            st.error("⚠️ Link non valido o preventivo non trovato. Contatta PolisEnergia.")
+            st.stop()
+
+        idx           = df[df['Codice_Clean'] == cod_u].index[0]
+        nome_cliente  = df.at[idx, "Cliente"]
+        stato_attuale = str(df.at[idx, "Stato"]).strip()
+
+        # ── Modalità anteprima operatore (senza OTP) ──
+        if not otp_u:
+            st.info(f"🔍 Modalità Anteprima Operatore - Cliente: **{nome_cliente}**")
+            dati_per_html = df.iloc[idx].to_dict()
+            try:
+                codice_html = genera_html_polis(dati_per_html)
+                st.components.v1.html(codice_html, height=900, scrolling=True)
+                st.download_button(
+                    label="📥 Scarica file HTML",
+                    data=codice_html,
+                    file_name=f"Preventivo_{cod_u}.html",
+                    mime="text/html"
+                )
+            except Exception as e:
+                mostra_errore("Errore nella generazione grafica.", e)
+                if DEBUG_MODE:
+                    st.write("Dati grezzi preventivo:", dati_per_html)
+            st.stop()
+
+        # ── Già firmato ──
+        if stato_attuale.upper() == "ACCETTATO":
+            st.success("✅ Questo preventivo è già stato firmato. Grazie!")
+            st.stop()
+
+        # ── OTP attivo dal foglio (non dall'URL) ──
+        otp_nel_foglio = ""
+        if "OTP" in df.columns:
+            otp_nel_foglio = str(df.at[idx, "OTP"]).strip()
+            if otp_nel_foglio in {"nan", "None"}:
+                otp_nel_foglio = ""
+
+        # Fallback retrocompatibile: preventivi vecchi senza OTP nel foglio
+        # usano ancora il valore del param URL come fonte di verità.
+        otp_valido = otp_nel_foglio or otp_u
+
+        # Se c'è OTP nel foglio ed è diverso dal param → link vecchio (reinvio fatto)
+        if otp_nel_foglio and otp_u != otp_nel_foglio:
+            st.error(
+                "⚠️ Questo link non è più valido. È stato inviato un preventivo aggiornato: "
+                "controlla la mail più recente o contatta PolisEnergia."
+            )
+            st.stop()
+
+        # ── Scadenza basata su data creazione ──
+        data_creazione = str(df.at[idx, "Data"]).strip()
+        try:
+            data_per_scadenza = datetime.strptime(data_creazione, "%d/%m/%Y")
+        except Exception:
+            st.error("Data preventivo non leggibile. Contatta PolisEnergia.")
+            st.stop()
+
+        data_scadenza    = data_per_scadenza + timedelta(days=OTP_SCADENZA_GIORNI)
+        if datetime.now() > data_scadenza:
+            st.error(
+                f"⏰ Il link di firma è scaduto (validità {OTP_SCADENZA_GIORNI} giorni). "
+                f"Contatta PolisEnergia per ricevere un nuovo preventivo."
+            )
+            st.stop()
+
+        try:
+            importo_totale = float(df.at[idx, "Totale"])
+        except Exception:
+            importo_totale = 0.0
+
+        giorni_rimanenti = (data_scadenza - datetime.now()).days
+
+        # ── Box istruzioni pagamento ──
+        st.markdown(f"""
+            <div style="background:rgba(255,255,255,0.1);padding:20px;border-radius:10px;
+                        border:1px solid white;margin-bottom:25px;">
+                <h3 style="color:white;margin-top:0;">💳 Istruzioni per il pagamento</h3>
+                <p style="color:white;font-size:1.1em;"><strong>Cliente:</strong> {nome_cliente}</p>
+                <p style="color:white;font-size:1.1em;">
+                    <strong>Importo:</strong> {importo_totale:.2f} EUR
+                </p>
+                <p style="color:#ffe08a;font-size:0.9em;">
+                    ⏳ Link valido ancora per <strong>{giorni_rimanenti} giorni</strong>
+                    (scade il {data_scadenza.strftime('%d/%m/%Y')})
+                </p>
+                <hr style="border-color:rgba(255,255,255,0.3);">
+                <p style="color:white;font-weight:bold;margin-bottom:5px;">COORDINATE BANCARIE:</p>
+                <ul style="color:white;list-style-type:none;padding-left:0;">
+                    <li><strong>Intestatario:</strong> {INTESTATARIO}</li>
+                    <li><strong>Banca:</strong> {NOME_BANCA}</li>
+                    <li><strong>IBAN:</strong>
+                        <span style="font-family:monospace;background:rgba(0,0,0,0.2);
+                                     padding:2px 5px;">{IBAN_POLIS}</span>
+                    </li>
+                    <li><strong>Causale:</strong> Accettazione Preventivo {cod_u} - {nome_cliente}</li>
+                </ul>
+            </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<p style='color:white;font-weight:bold;'>Inserisci l'OTP ricevuto via mail:</p>",
+                    unsafe_allow_html=True)
+        otp_in = st.text_input("OTP:", max_chars=6, label_visibility="collapsed")
+
+        if st.button("✅ FIRMA E ACCETTA ORA"):
+            if not otp_in.strip():
+                st.warning("Inserisci il codice OTP prima di procedere.")
+            elif otp_in.strip() == otp_valido:
+                df.at[idx, "Stato"]      = "ACCETTATO"
+                df.at[idx, "Data Firma"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+                conn.update(data=df.drop(columns=['Codice_Clean']))
+
+                try:
+                    smtp = get_smtp_config()
+                    invia_email(
+                        smtp=smtp,
+                        to=smtp["sender"],
+                        subject=f"✅ PREVENTIVO FIRMATO: {nome_cliente}",
+                        body=(
+                            f"Il cliente {nome_cliente} ha accettato il preventivo {cod_u}.\n"
+                            f"Data firma: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+                            f"Controlla il database."
+                        )
+                    )
+                except Exception:
+                    pass  # Notifica interna non bloccante
+
+                st.success("✅ Documento firmato con successo!")
+                st.balloons()
+            else:
+                st.error("❌ OTP non corretto. Riprova o contatta PolisEnergia.")
+
+    except Exception as e:
+        mostra_errore("Si è verificato un errore tecnico. Contatta PolisEnergia.", e)
+
+    st.stop()
+
+# ==============================================================================
 # 7. AUTENTICAZIONE OPERATORI
 # ==============================================================================
 if "autenticato" not in st.session_state:
@@ -765,7 +819,7 @@ if not st.session_state.autenticato:
     st.stop()
 
 # ==============================================================================
-# 8. NAVIGAZIONE (solo per operatori autenticati)
+# 8. NAVIGAZIONE (solo operatori autenticati)
 # ==============================================================================
 st.sidebar.success("✅ Accesso Autorizzato")
 st.sidebar.title("Navigazione")
@@ -775,7 +829,7 @@ scelta = st.sidebar.radio(
      "📊 Statistiche", "⚙️ Impostazioni"]
 )
 st.sidebar.divider()
-st.sidebar.caption(f"PolisEnergia Internal Tools v1.4 © {datetime.now().year}")
+st.sidebar.caption(f"PolisEnergia Internal Tools v2.0 © {datetime.now().year}")
 
 # ==============================================================================
 # 9. SEZIONE: AUTOLETTURE
@@ -792,7 +846,7 @@ if scelta == "Autoletture":
     st.divider()
     st.subheader("📁 Caricamento File")
     col1, col2 = st.columns(2)
-    file_tech   = col1.file_uploader("1. Anagrafica Tecnica (Excel)", type=["xlsx", "xls"])
+    file_tech    = col1.file_uploader("1. Anagrafica Tecnica (Excel)", type=["xlsx", "xls"])
     file_letture = col2.file_uploader("2. Autoletture (CSV)", type="csv")
 
     if file_tech and file_letture:
@@ -802,19 +856,9 @@ if scelta == "Autoletture":
                 progress_bar = st.progress(0)
 
                 with st.spinner("Elaborazione in corso..."):
-                    # --- Lettura ARERA ---
-                    df_arera = pd.read_csv(
-                        FILE_ARERA, encoding='latin-1', sep=';',
-                        on_bad_lines='skip', dtype=str
-                    )
-                    df_arera.columns = [c.strip().upper() for c in df_arera.columns]
-                    mappa_piva_distr = {
-                        "".join(filter(str.isdigit, str(r['PARTITA IVA']))).zfill(11):
-                        {'nome': str(r['RAGIONE SOCIALE']).strip().upper()}
-                        for _, r in df_arera.iterrows()
-                    }
+                    mappa_piva_distr = carica_arera(FILE_ARERA)
 
-                    # --- Lettura Anagrafica Tecnica ---
+                    # --- Anagrafica Tecnica ---
                     df_tech = pd.read_excel(file_tech, dtype=str)
                     df_tech.columns = [c.strip().upper() for c in df_tech.columns]
 
@@ -844,7 +888,7 @@ if scelta == "Autoletture":
                         if c_matr_corr else {}
                     )
 
-                    # --- Lettura Autoletture ---
+                    # --- Autoletture ---
                     df_let = pd.read_csv(
                         file_letture, sep=None, engine='python',
                         encoding='utf-8-sig', dtype=str
@@ -858,12 +902,11 @@ if scelta == "Autoletture":
                     progress_bar.progress(25)
 
                     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-
                         # Excel per distributori esterni
                         if not df_tech_esterni.empty:
                             grp_cols = ['PIVA_UDD', 'RAGIONE_SOCIALE_UDD']
                             for (piva_udd, rag_soc), group in df_tech_esterni.groupby(grp_cols):
-                                group_pdr_clean  = group['COD_PDR_CLEAN'].tolist()
+                                group_pdr_clean = group['COD_PDR_CLEAN'].tolist()
                                 autolett_est = df_let[
                                     df_let[col_pdr].str.split('.').str[0].str.zfill(14)
                                     .isin(group_pdr_clean)
@@ -880,8 +923,8 @@ if scelta == "Autoletture":
                         # Raggruppamento XML per Polis
                         gruppi: dict[str, list] = defaultdict(list)
                         for _, riga in df_let.iterrows():
-                            pdr_clean   = str(riga[col_pdr]).split('.')[0].zfill(14)
-                            piva_dd     = mappa_pdr_distr.get(pdr_clean)
+                            pdr_clean = str(riga[col_pdr]).split('.')[0].zfill(14)
+                            piva_dd   = mappa_pdr_distr.get(pdr_clean)
                             if not piva_dd:
                                 continue
                             info_arera = mappa_piva_distr.get(piva_dd)
@@ -901,7 +944,7 @@ if scelta == "Autoletture":
                                                if pdr_clean in mappa_matr_corr else None),
                                 })
 
-                        # Scrittura XML nello ZIP
+                        # Scrittura XML
                         tot_g = len(gruppi)
                         for i, (piva_d, lista) in enumerate(gruppi.items()):
                             root = ET.Element("Prestazione", cod_servizio="TAL", cod_flusso="0050")
@@ -921,23 +964,17 @@ if scelta == "Autoletture":
 
                             xml_str = ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
-                            # Mese/anno dalla data della prima lettura del gruppo (formato MMAAAA)
                             try:
-                                data_prima = formatta_data_italiana(lista[0]['data'])  # GG/MM/AAAA
+                                data_prima = formatta_data_italiana(lista[0]['data'])
                                 parti_d    = data_prima.split('/')
-                                mmaaaa     = f"{parti_d[1]}{parti_d[2]}"              # MMAAAA
+                                mmaaaa     = f"{parti_d[1]}{parti_d[2]}"
                             except Exception:
                                 mmaaaa = datetime.now().strftime("%m%Y")
 
-                            # Cartella = ragione sociale del distributore (safe per filesystem)
                             rag_soc_safe = re.sub(r'[\\/:*?"<>|]+', '_',
                                                    lista[0]['distr_nome'])[:40].strip()
-
-                            # Nome file: TAL_0050_PIVA_MITTENTE_PIVA_DISTR_MMAAAA.xml
                             piva_mitt_clean = "".join(filter(str.isdigit, piva_mittente))
                             nome_file = f"TAL_0050_{piva_mitt_clean}_{piva_d}_{mmaaaa}.xml"
-
-                            # Path dentro lo ZIP: RAGIONE_SOCIALE/nome_file.xml
                             zip_file.writestr(f"{rag_soc_safe}/{nome_file}", xml_str)
                             progress_bar.progress(50 + int(((i + 1) / tot_g) * 50))
 
@@ -953,7 +990,7 @@ if scelta == "Autoletture":
                 )
 
             except Exception as e:
-                st.error(f"Errore durante l'elaborazione: {e}")
+                mostra_errore("Errore durante l'elaborazione.", e)
 
 # ==============================================================================
 # 10. SEZIONE: PREVENTIVO DI CONNESSIONE
@@ -963,17 +1000,17 @@ elif scelta == "Preventivo di Connessione":
 
     # --- Dati cliente ---
     c1, c2 = st.columns(2)
-    nome        = c1.text_input("Ragione Sociale", key="n").upper()
-    email_dest  = c1.text_input("Email Cliente",   key="m")
-    indirizzo   = c1.text_input("Indirizzo Impianto", key="ind")
-    pod         = c2.text_input("POD",              key="p").upper()
-    regime      = c2.selectbox("Regime IVA", ["10%", "22%", "Esente", "P.A."], key="r")
+    nome       = c1.text_input("Ragione Sociale", key="n").upper()
+    email_dest = c1.text_input("Email Cliente",   key="m")
+    indirizzo  = c1.text_input("Indirizzo Impianto", key="ind")
+    pod        = c2.text_input("POD",              key="p").upper()
+    regime     = c2.selectbox("Regime IVA", ["10%", "22%", "Esente", "P.A."], key="r")
 
     st.divider()
 
     # --- Configurazione pratica ---
     c3, c4 = st.columns([2, 1])
-    pratica  = c3.selectbox(
+    pratica = c3.selectbox(
         "Tipo Pratica",
         ["Aumento Potenza", "Subentro con Modifica",
          "Attivazione su Preposato con Modifica",
@@ -981,13 +1018,12 @@ elif scelta == "Preventivo di Connessione":
         key="prat"
     )
     tipo_ut = c4.radio("Utenza", ["Domestico", "Altri Usi"], horizontal=True, key="ut")
-   
 
     # Inizializzazione valori
     p_att, p_new, c_dist, delta, tar = 0.0, 0.0, 0.0, 0.0, 0.0
-    passaggio_mt   = False
-    t_partenza     = "BT"
-    tipo_fornitura = "Permanente"
+    passaggio_mt     = False
+    t_partenza       = "BT"
+    tipo_fornitura   = "Permanente"
     no_lim_attuale   = False
     richiesta_no_lim = False
     escludi_gestione = st.checkbox("Sconto 100% Gestione Polis", value=False)
@@ -995,17 +1031,16 @@ elif scelta == "Preventivo di Connessione":
     if "Potenza" in pratica or "Subentro" in pratica or "Attivazione" in pratica:
         col1, col2 = st.columns(2)
         if tipo_ut == "Altri Usi":
-            t_partenza   = col1.selectbox("Tensione", ["BT", "MT"], key="t")
+            t_partenza = col1.selectbox("Tensione", ["BT", "MT"], key="t")
             if t_partenza == "BT":
                 passaggio_mt = col1.checkbox("Passaggio a MT?", key="mt")
         p_att = col1.number_input("kW Attuali (Contrattuali)",   value=0.0, key="pa")
         p_new = col2.number_input("kW Richiesti (Contrattuali)", value=0.0, key="pn")
 
-        # --- LOGICA FRANCHIGIA INVERTITA ---
-        if tipo_ut == "Altri Usi" and p_new <= 30:
+        if tipo_ut == "Altri Usi" and p_new <= SOGLIA_LIMITATORE:
             st.info("⚙️ Gestione Limitatore (Franchigia 10%)")
             cx1, cx2 = st.columns(2)
-            no_lim_attuale   = cx1.checkbox(
+            no_lim_attuale = cx1.checkbox(
                 "Stato Attuale: POD SENZA limitatore", value=False,
                 help="Spunta se il cliente ha già il prelievo libero (senza +10%)"
             )
@@ -1015,7 +1050,6 @@ elif scelta == "Preventivo di Connessione":
             )
 
     elif "Nuova" in pratica:
-        # Tipo fornitura
         tipo_fornitura = st.radio(
             "Tipo fornitura", ["Permanente", "Temporanea"],
             horizontal=True, key="forn"
@@ -1024,26 +1058,22 @@ elif scelta == "Preventivo di Connessione":
         if tipo_fornitura == "Permanente":
             p_new  = st.number_input("kW Richiesti", value=0.0, key="pnc")
             c_dist = st.number_input("Quota Distanza €", 0.0,   key="dist")
-            if tipo_ut == "Altri Usi" and p_new <= 30:
+            if tipo_ut == "Altri Usi" and p_new <= SOGLIA_LIMITATORE:
                 richiesta_no_lim = st.checkbox(
                     "Richiedere potenza a prelievo LIBERO (senza franchigia)", value=False
                 )
-
         else:  # Temporanea
             p_new = st.number_input("kW Richiesti", value=0.0, key="pnc")
-
-            if p_new <= 40:
-                # Tariffa fissa — solo scelta attraversamento stradale
+            if p_new <= SOGLIA_TEMP_KW:
                 attr_str = st.radio(
                     "Attraversamento stradale?",
-                    ["No (168,01 €)", "Sì (280,01 €)"],
+                    [f"No ({TEMP_LE40_NO_ATTR:.2f} €)", f"Sì ({TEMP_LE40_ATTR:.2f} €)"],
                     horizontal=True, key="attr_str"
                 )
-                c_dist = 280.01 if "Sì" in attr_str else 168.01
+                c_dist = TEMP_LE40_ATTR if "Sì" in attr_str else TEMP_LE40_NO_ATTR
                 st.info(f"Quota fissa fornitura temporanea: **{c_dist:.2f} €**")
             else:
-                # Oltre 40 kW — quota fissa calcolata dal distributore, inserita manualmente
-                st.info("Potenza > 40 kW: inserire la quota comunicata dal distributore.")
+                st.info(f"Potenza > {SOGLIA_TEMP_KW} kW: inserire la quota comunicata dal distributore.")
                 c_dist = st.number_input("Quota fissa distributore €", 0.0, key="dist")
 
     elif "Spostamento" in pratica:
@@ -1051,15 +1081,13 @@ elif scelta == "Preventivo di Connessione":
         c_dist = (SPOSTAMENTO_10MT if "Entro" in s_dist
                   else st.number_input("Costo Rilievo €", 0.0, key="sdc"))
 
-    # Calcolo delta e tariffa
+    # --- Calcolo delta e tariffa ---
     if p_new > 0:
-        # Nuova potenza: +10% se Domestico o se Altri Usi non ha chiesto rimozione limitatore
-        if p_new <= 30 and (tipo_ut == "Domestico" or not richiesta_no_lim):
+        if p_new <= SOGLIA_LIMITATORE and (tipo_ut == "Domestico" or not richiesta_no_lim):
             v_new = round(p_new * 1.1, 1)
         else:
             v_new = p_new
 
-        # Potenza attuale: +10% se Domestico o se Altri Usi ha ancora il limitatore
         if p_att > 0:
             if tipo_ut == "Domestico" or not no_lim_attuale:
                 v_att = round(p_att * 1.1, 1)
@@ -1074,17 +1102,15 @@ elif scelta == "Preventivo di Connessione":
             tar = TIC_ALTRI_USI_BT
         elif t_partenza == "MT" or passaggio_mt:
             tar = TIC_MT
-        elif tipo_ut == "Domestico" and p_new <= 6 and "Potenza" in pratica:
-            # Tariffa agevolata solo per Aumento Potenza domestico ≤6kW
+        elif tipo_ut == "Domestico" and p_new <= SOGLIA_AGEVOL_DOM and "Potenza" in pratica:
             tar = TIC_DOMESTICO_LE6
         else:
             tar = TIC_ALTRI_USI_BT
 
-    # Calcolo importi
+    # --- Calcolo importi ---
     if "Spostamento" in pratica:
         c_tec = c_dist
     elif "Nuova" in pratica:
-        # Temporanea: sempre quota fissa (≤40kW da tariffario, >40kW da distributore)
         if tipo_fornitura == "Temporanea":
             c_tec = c_dist
         else:
@@ -1094,19 +1120,17 @@ elif scelta == "Preventivo di Connessione":
 
     if passaggio_mt:
         c_tec += COSTO_PASSAGGIO_MT
-    if escludi_gestione:
-        c_gest = 0.0
-    else:
-        c_gest = round((c_tec + FISSO_BASE_CALCOLO) * 0.1, 2)
+
+    c_gest = 0.0 if escludi_gestione else round((c_tec + FISSO_BASE_CALCOLO) * 0.1, 2)
     imp    = round(c_tec + c_gest + ONERI_ISTRUTTORIA, 2)
     iva_p  = 10 if "10" in regime else (22 if "22" in regime or "P.A." in regime else 0)
     iva_e  = round(imp * (iva_p / 100), 2)
-    bollo  = 2.0 if (regime == "Esente" and imp > 77.47) else 0.0
+    bollo  = BOLLO_ESENTE if (regime == "Esente" and imp > SOGLIA_BOLLO) else 0.0
     totale = (round(imp + bollo, 2)
-                if "P.A." in regime
-                else round(imp + iva_e + bollo, 2))
+              if "P.A." in regime
+              else round(imp + iva_e + bollo, 2))
 
-    # --- Anteprima calcolo ---
+    # --- Anteprima ---
     st.subheader("📊 Anteprima Calcolo")
     col_t1, col_t2 = st.columns([2, 1])
     with col_t1:
@@ -1122,13 +1146,12 @@ elif scelta == "Preventivo di Connessione":
 
     st.divider()
 
-    # --- Azioni principali ---
+    # --- Azioni ---
     btn1, btn2 = st.columns(2)
 
     with btn1:
         if st.button("📄 1. GENERA PDF E ARCHIVIA", type="primary",
                      use_container_width=True, key="btn_genera"):
-            # Validazione campi obbligatori
             errori = []
             if not nome.strip():
                 errori.append("Ragione Sociale")
@@ -1138,68 +1161,61 @@ elif scelta == "Preventivo di Connessione":
                 errori.append("Email Cliente")
             if p_new <= 0 and "Spostamento" not in pratica:
                 errori.append("kW Richiesti (deve essere > 0)")
+
             if errori:
                 st.error(f"⚠️ Compila i campi obbligatori: {', '.join(errori)}")
             else:
                 cod = datetime.now().strftime("%y%m%d%H%M%S")
-                st.session_state.current_cod  = cod
+                st.session_state.current_cod = cod
 
-                # --- Controllo duplicati POD ---
+                # OTP generato subito così lo salviamo nel foglio
+                otp_corrente = genera_otp()
+                st.session_state.current_otp = otp_corrente
+
+                # Controllo duplicati POD
+                cod_padre = ""
                 try:
                     conn_check = st.connection("gsheets", type=GSheetsConnection)
                     df_check   = conn_check.read(ttl=0)
                     if not df_check.empty and "POD" in df_check.columns:
                         attivi = df_check[
                             (df_check["POD"].astype(str).str.strip() == pod.strip()) &
-                            (df_check["Stato"].astype(str).str.strip().isin(["Inviato", "INVIATO"]))
+                            (df_check["Stato"].astype(str).str.strip().str.upper().isin(["INVIATO"]))
                         ]
                         if not attivi.empty:
-                            cod_esistente = attivi.iloc[-1]["Codice"]
+                            cod_padre = str(attivi.iloc[-1]["Codice"]).strip()
                             st.warning(
                                 f"⚠️ Esiste già un preventivo attivo per il POD **{pod}** "
-                                f"(codice: `{cod_esistente}`). "
+                                f"(codice: `{cod_padre}`). "
                                 f"Il nuovo sarà archiviato come revisione."
                             )
-                            # Storico versioni: il nuovo codice porta il riferimento al precedente
-                            cod_padre = str(cod_esistente).strip()
-                        else:
-                            cod_padre = ""
-                    else:
-                        cod_padre = ""
                 except Exception:
-                    cod_padre = ""
+                    pass
 
                 dati_preventivo = {
                     "Codice": cod, "Cliente": nome, "POD": pod, "Indirizzo": indirizzo,
                     "C_Tec": c_tec, "Oneri": ONERI_ISTRUTTORIA, "Gestione": c_gest,
                     "Imponibile": imp, "IVA_Perc": iva_p, "IVA_Euro": iva_e,
                     "Totale": totale, "IBAN": IBAN_LABEL,
-                    "Pratica":       pratica,
+                    "Pratica":        pratica,
                     "Tipo_Fornitura": tipo_fornitura,
-                    "Delta":         delta,
-                    "Tariffa":       tar,
-                    "P_New":         p_new,
-                    "P_Att":         p_att,
-                    "C_Dist":        c_dist,
-                    "Passaggio_MT":  passaggio_mt,
+                    "Delta":          delta,
+                    "Tariffa":        tar,
+                    "P_New":          p_new,
+                    "P_Att":          p_att,
+                    "C_Dist":         c_dist,
+                    "Passaggio_MT":   passaggio_mt,
                 }
                 st.session_state.pdf_bytes = genera_pdf_polis(dati_preventivo)
                 html_preventivo            = genera_html_polis(dati_preventivo)
+                html_b64                   = comprimi_html(html_preventivo)
 
-                # Comprimi con zlib prima di Base64 — riduce ~75% la dimensione
-                import zlib
-                html_b64 = _b64.b64encode(
-                    zlib.compress(html_preventivo.encode("utf-8"), level=9)
-                ).decode("utf-8")
-
-                # Verifica dimensione prima di scrivere (limite GSheets: 50.000 char)
-                if len(html_b64) > 49000:
-                    html_b64 = ""  # troppo grande — saltiamo l'HTML, il PDF resta disponibile
+                if not html_b64:
                     st.warning("⚠️ HTML troppo grande per il foglio — solo PDF disponibile.")
 
                 try:
                     conn       = st.connection("gsheets", type=GSheetsConnection)
-                    df_current = conn.read(ttl=0)   # leggiamo PRIMA di modificare
+                    df_current = conn.read(ttl=0)
                     nuova_riga = pd.DataFrame([{
                         "Data":        datetime.now().strftime("%d/%m/%Y"),
                         "Codice":      str(cod),
@@ -1213,15 +1229,16 @@ elif scelta == "Preventivo di Connessione":
                         "Stato":       "Inviato",
                         "Email":       email_dest,
                         "HTML_B64":    html_b64,
+                        "OTP":         otp_corrente,
                     }])
                     df_finale = pd.concat([df_current, nuova_riga], ignore_index=True)
                     conn.update(data=df_finale)
                     st.success(f"✅ Preventivo {cod} generato e archiviato!")
                 except Exception as e:
-                    st.warning(f"PDF generato, ma errore salvataggio Google Sheets: {e}")
+                    mostra_errore("PDF generato, ma errore salvataggio Google Sheets.", e)
 
     with btn2:
-        if 'pdf_bytes' in st.session_state and st.session_state.pdf_bytes:
+        if st.session_state.get('pdf_bytes'):
             st.download_button(
                 label="📥 2. SCARICA PDF",
                 data=io.BytesIO(st.session_state.pdf_bytes),
@@ -1234,19 +1251,15 @@ elif scelta == "Preventivo di Connessione":
             st.button("📥 2. SCARICA PDF", disabled=True,
                       use_container_width=True, key="btn_download_dis")
 
-    # --- Invio email (abilitato solo dopo generazione PDF) ---
+    # --- Invio email ---
     if 'current_cod' in st.session_state and 'pdf_bytes' in st.session_state:
         st.divider()
         st.subheader("📧 Invio Documentazione al Cliente")
-
-        if 'current_otp' not in st.session_state:
-            st.session_state.current_otp = genera_otp()
 
         otp  = st.session_state.current_otp
         cod  = st.session_state.current_cod
         link = f"{APP_URL}/?codice={cod}&otp={otp}"
 
-        # Template da impostazioni (con fallback al default)
         template = st.session_state.get("email_template",
             "Spett.le {nome},\n"
             "in allegato il preventivo n. {codice}.\n\n"
@@ -1279,7 +1292,7 @@ elif scelta == "Preventivo di Connessione":
                         )
                     st.success("✅ Email inviata con successo!")
                 except Exception as e:
-                    st.error(f"Errore durante l'invio: {e}")
+                    mostra_errore("Errore durante l'invio.", e)
     else:
         st.info("ℹ️ Genera il PDF prima di procedere con l'invio della mail.")
 
@@ -1297,7 +1310,6 @@ elif scelta == "Preventivo di Connessione":
         st.warning("⚠️ Sei sicuro? Tutti i dati del preventivo corrente verranno persi.")
         c_si, c_no = st.columns(2)
         if c_si.button("✅ Sì, pulisci", use_container_width=True, key="pulisci_si"):
-            # Conserva login e impostazioni — cancella solo i dati del preventivo corrente
             CONSERVA = {"autenticato", "email_template"}
             for key in [k for k in st.session_state.keys() if k not in CONSERVA]:
                 del st.session_state[key]
@@ -1314,59 +1326,33 @@ elif scelta == "📋 Archivio Preventivi":
 
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
-        df   = conn.read(ttl=0)
+        df   = conn.read(ttl=GSHEETS_CACHE_TTL)
 
         if df.empty:
             st.info("Nessun preventivo in archivio.")
             st.stop()
 
-        # ── Stato effettivo ────────────────────────────────────────────────────
-        oggi = datetime.now()
-        def stato_effettivo(row):
-            s = str(row.get("Stato", "")).strip().upper()
-            if s == "PAGATO":    return "PAGATO"
-            if s == "ACCETTATO": return "ACCETTATO"
-            try:
-                data_c = datetime.strptime(str(row["Data"]).strip(), "%d/%m/%Y")
-                if oggi > data_c + timedelta(days=OTP_SCADENZA_GIORNI):
-                    return "SCADUTO"
-            except Exception:
-                pass
-            return "INVIATO"
+        df["Stato Reale"] = df.apply(calcola_stato_reale, axis=1)
 
-        df["Stato Reale"] = df.apply(stato_effettivo, axis=1)
-
-        # ── KPI ───────────────────────────────────────────────────────────────
-        n_inv  = len(df[df["Stato Reale"] == "INVIATO"])
-        n_acc  = len(df[df["Stato Reale"].isin(["ACCETTATO", "PAGATO"])])
-        n_pag  = len(df[df["Stato Reale"] == "PAGATO"])
-        n_sca  = len(df[df["Stato Reale"] == "SCADUTO"])
+        # KPI
+        n_inv = len(df[df["Stato Reale"] == "INVIATO"])
+        n_acc = len(df[df["Stato Reale"].isin(["ACCETTATO", "PAGATO"])])
+        n_sca = len(df[df["Stato Reale"] == "SCADUTO"])
         try:
-            val_acc = float(df[df["Stato Reale"].isin(["ACCETTATO","PAGATO"])]["Totale"].astype(float).sum())
+            val_acc = float(df[df["Stato Reale"].isin(["ACCETTATO", "PAGATO"])]["Totale"].astype(float).sum())
         except Exception:
             val_acc = 0.0
 
-        # ── Costruzione righe JSON per il componente HTML ──────────────────────
+        # Costruzione righe JSON
         ha_link = "HTML_B64" in df.columns
         righe = []
         for _, r in df.iterrows():
             data_uri = ""
             if ha_link:
-                b64v = str(r.get("HTML_B64", "")).strip()
-                if b64v and b64v not in {"", "nan"}:
-                    try:
-                        import zlib
-                        # Prova prima a decomprimere (nuovi preventivi compressi)
-                        html_dec = zlib.decompress(_b64.b64decode(b64v)).decode("utf-8")
-                    except Exception:
-                        # Fallback: Base64 semplice (preventivi vecchi non compressi)
-                        try:
-                            html_dec = _b64.b64decode(b64v).decode("utf-8")
-                        except Exception:
-                            html_dec = ""
-                    if html_dec:
-                        b64_clean = _b64.b64encode(html_dec.encode("utf-8")).decode("utf-8")
-                        data_uri  = f"data:text/html;base64,{b64_clean}"
+                html_dec = decomprimi_html(str(r.get("HTML_B64", "")).strip())
+                if html_dec:
+                    b64_clean = _b64.b64encode(html_dec.encode("utf-8")).decode("utf-8")
+                    data_uri  = f"data:text/html;base64,{b64_clean}"
             righe.append({
                 "data":    str(r.get("Data",       "")).strip(),
                 "cod":     str(r.get("Codice",     "")).strip().replace(".0", ""),
@@ -1378,9 +1364,6 @@ elif scelta == "📋 Archivio Preventivi":
                 "firma":   str(r.get("Data Firma", "")).strip(),
                 "link":    data_uri,
             })
-
-        import json
-        import streamlit.components.v1 as components
 
         html_archivio = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
@@ -1511,7 +1494,6 @@ function render(){{
         : '<span style="color:#ccc;font-size:11px">—</span>'}}</td>
     </tr>`).join('');
 
-  // Riga espandi/comprimi
   const expandRow = document.getElementById('expand-row');
   if(totale > 10){{
     expandRow.style.display = '';
@@ -1530,7 +1512,6 @@ function render(){{
   document.getElementById('cnt').textContent =
     `${{mostraTutti || totale<=10 ? totale : '10 di '+totale}} preventiv${{totale===1?'o':'i'}}`;
 
-  // Aggiorna frecce ordinamento
   document.querySelectorAll('th').forEach(th=>th.classList.remove('asc','desc'));
   const cols=['data','cod','cliente','pod','totale','stato','firma'];
   const idx=cols.indexOf(sortCol);
@@ -1543,7 +1524,6 @@ function toggleMostraTutti(){{
 }}
 
 function apriHTML(b64url) {{
-  // Estrae il Base64 dal data URI e lo apre come blob — aggira il blocco browser sui data: URI
   const b64 = b64url.replace('data:text/html;base64,', '');
   const bin = atob(b64);
   const arr = new Uint8Array(bin.length);
@@ -1570,11 +1550,10 @@ document.getElementById('q').addEventListener('input',render);
 render();
 </script></body></html>"""
 
-        # Altezza: fissa per 10 righe + header + footer + toolbar
         h = min(900, max(400, 280 + min(len(df), 10) * 44))
         components.html(html_archivio, height=h, scrolling=True)
 
-        # ── EXPORT EXCEL (rimane in Streamlit) ────────────────────────────────
+        # ── EXPORT EXCEL ──
         buf_xls = io.BytesIO()
         export_cols = [c for c in ["Data", "Codice", "Versione_Di", "Cliente", "POD",
                                     "Totale", "Stato Reale", "Email", "Data Firma"]
@@ -1589,7 +1568,7 @@ render();
             use_container_width=True,
         )
 
-        # ── REINVIO EMAIL ──────────────────────────────────────────────────────
+        # ── REINVIO EMAIL ──
         st.divider()
         st.subheader("📨 Reinvia email a cliente")
 
@@ -1615,7 +1594,7 @@ render();
                     value=email_r if email_r not in {"", "nan"} else "",
                     key="email_reinvio"
                 )
-                otp_key      = f"otp_reinvio_{cod_reinvio}"
+                otp_key   = f"otp_reinvio_{cod_reinvio}"
                 if otp_key not in st.session_state:
                     st.session_state[otp_key] = genera_otp()
                 nuovo_otp    = st.session_state[otp_key]
@@ -1651,15 +1630,17 @@ render();
                                             body=corpo_r)
                             idx_r = df[df["Codice"].astype(str) == cod_reinvio].index[0]
                             df.at[idx_r, "Stato"] = "Inviato"
+                            # Salva il NUOVO OTP nel foglio: invalida automaticamente il vecchio link
+                            df.at[idx_r, "OTP"]   = nuovo_otp
                             if "Email" in df.columns:
                                 df.at[idx_r, "Email"] = email_reinvio.strip()
                             conn.update(data=df.drop(columns=["Stato Reale"], errors="ignore"))
                             del st.session_state[otp_key]
-                            st.success(f"✅ Email reinviata a {email_reinvio}!")
+                            st.success(f"✅ Email reinviata a {email_reinvio}! Il vecchio link non è più valido.")
                         except Exception as e:
-                            st.error(f"Errore invio: {e}")
+                            mostra_errore("Errore invio.", e)
 
-        # ── STORICO REVISIONI ─────────────────────────────────────────────────
+        # ── STORICO REVISIONI ──
         if "Versione_Di" in df.columns and df["Versione_Di"].notna().any():
             ver_non_vuote = df["Versione_Di"].astype(str).str.strip()
             if (ver_non_vuote != "").any() and (ver_non_vuote != "nan").any():
@@ -1670,14 +1651,13 @@ render();
                 ]["POD"].unique()
                 if len(pod_con_rev):
                     pod_sel = st.selectbox("POD:", pod_con_rev, key="pod_storico")
-                    catena  = df[df["POD"].astype(str) == pod_sel][
+                    catena = df[df["POD"].astype(str) == pod_sel][
                         ["Data", "Codice", "Versione_Di", "Totale", "Stato Reale"]
                     ].sort_values("Data")
                     st.dataframe(catena, use_container_width=True, hide_index=True)
 
     except Exception as e:
-        st.error("Impossibile caricare l'archivio.")
-        st.caption(f"Dettaglio tecnico: {e}")
+        mostra_errore("Impossibile caricare l'archivio.", e)
 
 
 # ==============================================================================
@@ -1687,35 +1667,16 @@ elif scelta == "📊 Statistiche":
     st.title("📊 Statistiche")
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
-        df   = conn.read(ttl=0)
+        df   = conn.read(ttl=GSHEETS_CACHE_TTL)
 
         if df.empty:
             st.info("Nessun dato disponibile.")
             st.stop()
 
-        oggi = datetime.now()
-        def stato_eff(row):
-            s = str(row.get("Stato", "")).strip().upper()
-            if s == "PAGATO":    return "PAGATO"
-            if s == "ACCETTATO": return "ACCETTATO"
-            try:
-                data_c = datetime.strptime(str(row["Data"]).strip(), "%d/%m/%Y")
-                if oggi > data_c + timedelta(days=OTP_SCADENZA_GIORNI):
-                    return "SCADUTO"
-            except Exception:
-                pass
-            return "INVIATO"
-
         def to_float(v):
             try: return float(str(v).replace(",", "."))
             except: return 0.0
 
-        df["Stato Reale"] = df.apply(stato_eff, axis=1)
-        df["Totale_N"]    = df["Totale"].apply(to_float)
-
-        # Margine: calcolato solo se Gestione e Oneri sono presenti nel foglio.
-        # I preventivi storici senza questi dati avranno Margine_N = NaN e
-        # vengono esclusi automaticamente dai totali di margine.
         def to_float_or_nan(v):
             try:
                 s = str(v).strip()
@@ -1724,6 +1685,9 @@ elif scelta == "📊 Statistiche":
                 return float(s.replace(",", "."))
             except:
                 return float("nan")
+
+        df["Stato Reale"] = df.apply(calcola_stato_reale, axis=1)
+        df["Totale_N"]    = df["Totale"].apply(to_float)
 
         if "Gestione" in df.columns and "Oneri" in df.columns:
             df["Gestione_N"] = df["Gestione"].apply(to_float_or_nan)
@@ -1741,17 +1705,15 @@ elif scelta == "📊 Statistiche":
             df["Mese"] = "N/D"
 
         # KPI
-        import numpy as np
-        n_tot    = len(df)
-        n_acc    = len(df[df["Stato Reale"].isin(["ACCETTATO", "PAGATO"])])
-        n_pag    = len(df[df["Stato Reale"] == "PAGATO"])
-        n_scad   = len(df[df["Stato Reale"] == "SCADUTO"])
-        inc_pag  = df[df["Stato Reale"] == "PAGATO"]["Totale_N"].sum()
-        # nansum: ignora i preventivi storici senza Gestione/Oneri
-        marg_pag = float(np.nansum(df[df["Stato Reale"] == "PAGATO"]["Margine_N"]))
-        n_con_margine = int(df[df["Stato Reale"] == "PAGATO"]["Margine_N"].notna().sum())
-        marg_pct = round(marg_pag / inc_pag * 100, 1) if inc_pag and marg_pag else 0
-        tasso    = round(n_acc / n_tot * 100, 1) if n_tot else 0
+        n_tot      = len(df)
+        n_acc      = len(df[df["Stato Reale"].isin(["ACCETTATO", "PAGATO"])])
+        n_pag      = len(df[df["Stato Reale"] == "PAGATO"])
+        n_scad     = len(df[df["Stato Reale"] == "SCADUTO"])
+        inc_pag    = df[df["Stato Reale"] == "PAGATO"]["Totale_N"].sum()
+        marg_pag   = float(np.nansum(df[df["Stato Reale"] == "PAGATO"]["Margine_N"]))
+        n_con_marg = int(df[df["Stato Reale"] == "PAGATO"]["Margine_N"].notna().sum())
+        marg_pct   = round(marg_pag / inc_pag * 100, 1) if inc_pag and marg_pag else 0
+        tasso      = round(n_acc / n_tot * 100, 1) if n_tot else 0
         n_inv_puro = n_tot - n_acc - n_scad
 
         mesi_sorted = sorted(df["Mese"].dropna().unique().tolist())
@@ -1770,9 +1732,6 @@ elif scelta == "📊 Statistiche":
                      for m in mesi_sorted]
         marg_mese = [round(float(np.nansum(df[(df["Mese"]==m)&(df["Stato Reale"]=="PAGATO")]["Margine_N"])),2)
                      for m in mesi_sorted]
-
-        import json
-        import streamlit.components.v1 as components
 
         html_stats = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
@@ -1797,7 +1756,7 @@ elif scelta == "📊 Statistiche":
     <span class="kpi-sub">incassato {inc_pag:,.0f} €</span></div>
   <div class="kpi"><span class="kpi-label">Margine reale</span>
     <span class="kpi-value" style="color:#3B6D11">{marg_pag:,.0f} €</span>
-    <span class="kpi-sub">{marg_pct}% sul fatturato{f" · su {n_con_margine}/{n_pag} pagati" if n_pag and n_con_margine < n_pag else ""}</span></div>
+    <span class="kpi-sub">{marg_pct}% sul fatturato{f" · su {n_con_marg}/{n_pag} pagati" if n_pag and n_con_marg < n_pag else ""}</span></div>
   <div class="kpi"><span class="kpi-label">Scaduti</span>
     <span class="kpi-value" style="color:#A32D2D">{n_scad}</span>
     <span class="kpi-sub">da reinviare</span></div>
@@ -1861,13 +1820,12 @@ new Chart(document.getElementById('c3'),{{type:'bar',
 
         components.html(html_stats, height=880, scrolling=False)
 
-        # ── PAGAMENTI ──────────────────────────────────────────────────────────
+        # ── PAGAMENTI ──
         st.divider()
         st.subheader("💰 Gestione Pagamenti")
 
         pagati = df[df["Stato Reale"] == "PAGATO"]
 
-        # Storico pagati
         if not pagati.empty:
             cols_p = [c for c in ["Data", "Codice", "Cliente", "POD",
                                    "Totale_N", "Margine_N", "Data Pagamento"]
@@ -1922,25 +1880,22 @@ new Chart(document.getElementById('c3'),{{type:'bar',
 
                 if col_comp:
                     df_fatt["_imp"] = sum(df_fatt[c].apply(to_f) for c in col_comp)
-                    imp_desc = " + ".join(col_comp)
                 else:
                     col_imp = trova_col(df_fatt, ["IMPORT","TOTAL","AMOUNT"])
                     if col_imp is None:
                         st.error("Colonna importo non trovata.")
-                        st.write("Colonne:", list(df_fatt.columns))
+                        if DEBUG_MODE:
+                            st.write("Colonne:", list(df_fatt.columns))
                         st.stop()
                     df_fatt["_imp"] = df_fatt[col_imp].apply(to_f)
-                    imp_desc = col_imp
 
                 if col_pod:  df_fatt["_pod"]  = df_fatt[col_pod].astype(str).str.strip().str.upper()
                 if col_cli:  df_fatt["_cli"]  = df_fatt[col_cli].astype(str).str.strip().str.upper()
                 if col_dpag: df_fatt["_dpag"] = df_fatt[col_dpag].astype(str).str.strip()
 
-                # Diagnostica visibile — mostra cosa c'è nell'archivio vs fatture
                 candidati = df[df["Stato Reale"] != "PAGATO"].copy()
                 col_diag1, col_diag2 = st.columns(2)
-                col_diag1.metric("Preventivi da abbinare", len(candidati),
-                                  help="Tutti i preventivi non ancora segnati come PAGATO")
+                col_diag1.metric("Preventivi da abbinare", len(candidati))
                 col_diag2.metric("Fatture nel file", len(df_fatt))
 
                 if candidati.empty:
@@ -2014,7 +1969,6 @@ new Chart(document.getElementById('c3'),{{type:'bar',
                             "Importo fatt.": st.column_config.NumberColumn("Importo fatt. €",format="%.2f"),
                         })
                 elif not non_trovati:
-                    # Nessun candidato trovato — mostra dati grezzi per debug
                     st.warning("Nessuna corrispondenza trovata. Verifica i dati:")
                     c1, c2 = st.columns(2)
                     with c1:
@@ -2068,15 +2022,17 @@ new Chart(document.getElementById('c3'),{{type:'bar',
                                 st.success(f"✅ {len(sel)} preventiv{'o' if len(sel)==1 else 'i'} segnati come PAGATO!")
                                 st.rerun()
                             except Exception as e:
-                                st.error(f"Errore: {e}")
+                                mostra_errore("Errore aggiornamento foglio.", e)
 
             except Exception as e:
-                st.error(f"Errore lettura file fatture: {e}")
+                mostra_errore("Errore lettura file fatture.", e)
 
     except Exception as e:
-        st.error("Impossibile caricare le statistiche.")
-        st.caption(f"Dettaglio tecnico: {e}")
+        mostra_errore("Impossibile caricare le statistiche.", e)
 
+# ==============================================================================
+# 13. SEZIONE: IMPOSTAZIONI
+# ==============================================================================
 elif scelta == "⚙️ Impostazioni":
     st.title("⚙️ Impostazioni")
 
@@ -2114,7 +2070,6 @@ elif scelta == "⚙️ Impostazioni":
 
     col_s1, col_s2 = st.columns(2)
     if col_s1.button("💾 Salva template", use_container_width=True):
-        # Verifica che le variabili obbligatorie siano presenti
         mancanti = [v for v in ["{nome}", "{codice}", "{link}", "{otp}"]
                     if v not in nuovo_template]
         if mancanti:
@@ -2129,7 +2084,7 @@ elif scelta == "⚙️ Impostazioni":
         st.success("Template ripristinato.")
         st.rerun()
 
-    # Anteprima con dati fittizi
+    # Anteprima
     st.divider()
     st.subheader("👁 Anteprima")
     try:
