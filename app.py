@@ -3,7 +3,13 @@ PolisEnergia — Operation Suite
 ==============================
 App Streamlit per gestione autoletture, preventivi di connessione e archivio.
 
-Versione: 2.0 (refactored)
+Versione: 2.1
+Modifiche 2.1 (fix):
+  - Franchigia/limitatore: checkbox con key stabili (lo stato non si perde piu'
+    nei rerun) e calcolo di v_att con guardia su SOGLIA_LIMITATORE, simmetrica a v_new.
+  - Scadenza firma robusta: timestamp epoch 'Creato_TS' come fonte primaria +
+    parsing difensivo (dayfirst) della colonna 'Data' come fallback.
+
 Modifiche principali rispetto alla 1.4:
   - OTP salvato nel Google Sheet (i vecchi link vengono invalidati al reinvio)
   - Funzione `calcola_stato_reale` deduplicata e globale
@@ -184,6 +190,25 @@ def genera_otp() -> str:
     return str(secrets.randbelow(900000) + 100000)
 
 
+def _data_creazione_dt(row) -> "datetime | None":
+    """
+    Ricava la data di creazione come datetime in modo robusto e non ambiguo.
+    Priorita' al timestamp epoch 'Creato_TS' (immune al locale del foglio);
+    fallback su parsing difensivo di 'Data' con dayfirst=True.
+    Restituisce None se nessuna fonte e' interpretabile.
+    """
+    ts_str = str(row.get("Creato_TS", "")).strip()
+    if ts_str and ts_str not in {"nan", "None"}:
+        try:
+            return datetime.fromtimestamp(int(float(ts_str)))
+        except Exception:
+            pass
+    dt = pd.to_datetime(str(row.get("Data", "")).strip(), dayfirst=True, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt.to_pydatetime()
+
+
 def calcola_stato_reale(row, giorni_validita: int = OTP_SCADENZA_GIORNI) -> str:
     """
     Calcola lo stato effettivo di un preventivo considerando la scadenza.
@@ -194,12 +219,9 @@ def calcola_stato_reale(row, giorni_validita: int = OTP_SCADENZA_GIORNI) -> str:
         return "PAGATO"
     if s == "ACCETTATO":
         return "ACCETTATO"
-    try:
-        data_c = datetime.strptime(str(row["Data"]).strip(), "%d/%m/%Y")
-        if datetime.now() > data_c + timedelta(days=giorni_validita):
-            return "SCADUTO"
-    except Exception:
-        pass
+    data_c = _data_creazione_dt(row)
+    if data_c is not None and datetime.now() > data_c + timedelta(days=giorni_validita):
+        return "SCADUTO"
     return "INVIATO"
 
 
@@ -711,11 +733,9 @@ if codice_param:
             )
             st.stop()
 
-        # ── Scadenza basata su data creazione ──
-        data_creazione = str(df.at[idx, "Data"]).strip()
-        try:
-            data_per_scadenza = datetime.strptime(data_creazione, "%d/%m/%Y")
-        except Exception:
+        # ── Scadenza basata su data creazione (timestamp robusto, fallback su 'Data') ──
+        data_per_scadenza = _data_creazione_dt(df.loc[idx])
+        if data_per_scadenza is None:
             st.error("Data preventivo non leggibile. Contatta PolisEnergia.")
             st.stop()
 
@@ -829,7 +849,7 @@ scelta = st.sidebar.radio(
      "📊 Statistiche", "⚙️ Impostazioni"]
 )
 st.sidebar.divider()
-st.sidebar.caption(f"PolisEnergia Internal Tools v2.0 © {datetime.now().year}")
+st.sidebar.caption(f"PolisEnergia Internal Tools v2.1 © {datetime.now().year}")
 
 # ==============================================================================
 # 9. SEZIONE: AUTOLETTURE
@@ -1024,8 +1044,8 @@ elif scelta == "Preventivo di Connessione":
     passaggio_mt     = False
     t_partenza       = "BT"
     tipo_fornitura   = "Permanente"
-    no_lim_attuale   = False
-    richiesta_no_lim = False
+    no_lim_attuale   = st.session_state.get("no_lim_att", False)
+    richiesta_no_lim = st.session_state.get("no_lim_new", False)
     escludi_gestione = st.checkbox("Sconto 100% Gestione Polis", value=False)
 
     if "Potenza" in pratica or "Subentro" in pratica or "Attivazione" in pratica:
@@ -1037,17 +1057,21 @@ elif scelta == "Preventivo di Connessione":
         p_att = col1.number_input("kW Attuali (Contrattuali)",   value=0.0, key="pa")
         p_new = col2.number_input("kW Richiesti (Contrattuali)", value=0.0, key="pn")
 
-        if tipo_ut == "Altri Usi" and p_new <= SOGLIA_LIMITATORE:
+        mostra_att = p_att > 0 and p_att <= SOGLIA_LIMITATORE
+        mostra_new = p_new <= SOGLIA_LIMITATORE
+        if tipo_ut == "Altri Usi" and (mostra_att or mostra_new):
             st.info("⚙️ Gestione Limitatore (Franchigia 10%)")
             cx1, cx2 = st.columns(2)
-            no_lim_attuale = cx1.checkbox(
-                "Stato Attuale: POD SENZA limitatore", value=False,
-                help="Spunta se il cliente ha già il prelievo libero (senza +10%)"
-            )
-            richiesta_no_lim = cx2.checkbox(
-                "Nuova Config: Rimuovere Limitatore", value=False,
-                help="Spunta per richiedere potenza a prelievo libero (senza franchigia)"
-            )
+            if mostra_att:
+                no_lim_attuale = cx1.checkbox(
+                    "Stato Attuale: POD SENZA limitatore", key="no_lim_att",
+                    help="Spunta se il cliente ha già il prelievo libero (senza +10%)"
+                )
+            if mostra_new:
+                richiesta_no_lim = cx2.checkbox(
+                    "Nuova Config: Rimuovere Limitatore", key="no_lim_new",
+                    help="Spunta per richiedere potenza a prelievo libero (senza franchigia)"
+                )
 
     elif "Nuova" in pratica:
         tipo_fornitura = st.radio(
@@ -1060,7 +1084,7 @@ elif scelta == "Preventivo di Connessione":
             c_dist = st.number_input("Quota Distanza €", 0.0,   key="dist")
             if tipo_ut == "Altri Usi" and p_new <= SOGLIA_LIMITATORE:
                 richiesta_no_lim = st.checkbox(
-                    "Richiedere potenza a prelievo LIBERO (senza franchigia)", value=False
+                    "Richiedere potenza a prelievo LIBERO (senza franchigia)", key="no_lim_new"
                 )
         else:  # Temporanea
             p_new = st.number_input("kW Richiesti", value=0.0, key="pnc")
@@ -1089,7 +1113,7 @@ elif scelta == "Preventivo di Connessione":
             v_new = p_new
 
         if p_att > 0:
-            if tipo_ut == "Domestico" or not no_lim_attuale:
+            if p_att <= SOGLIA_LIMITATORE and (tipo_ut == "Domestico" or not no_lim_attuale):
                 v_att = round(p_att * 1.1, 1)
             else:
                 v_att = p_att
@@ -1218,6 +1242,7 @@ elif scelta == "Preventivo di Connessione":
                     df_current = conn.read(ttl=0)
                     nuova_riga = pd.DataFrame([{
                         "Data":        datetime.now().strftime("%d/%m/%Y"),
+                        "Creato_TS":   int(datetime.now().timestamp()),
                         "Codice":      str(cod),
                         "Versione_Di": cod_padre,
                         "Cliente":     nome,
